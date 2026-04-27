@@ -125,9 +125,11 @@ All endpoints require:
 
 ## Deploy (Render / Railway / Fly)
 
-**Full step-by-step:** see [`DEPLOY.md`](DEPLOY.md). Optional IaC: [`render.yaml`](render.yaml) ([Render Blueprint spec](https://render.com/docs/blueprint-spec)).
+Provision **web** (Gunicorn `config.wsgi`), **worker** (`celery -A config worker`), **beat** (`celery -A config beat`), **Postgres**, **Redis**.
 
-Summary: provision **web** (Gunicorn `config.wsgi`), **worker** (`celery -A config worker`), **beat** (`celery -A config beat`), **Postgres**, **Redis**; set `DATABASE_URL`, `CELERY_BROKER_URL`, `DJANGO_SECRET_KEY`, `DJANGO_DEBUG=false`, `DJANGO_ALLOWED_HOSTS`, `CORS_ALLOW_ALL=false`, `CORS_ALLOWED_ORIGINS`; build the frontend with `VITE_API_BASE_URL` = public API; run `migrate` and `seed_playto` once.
+Set at least: `DATABASE_URL`, `CELERY_BROKER_URL`, `DJANGO_SECRET_KEY`, `DJANGO_DEBUG=false`, `DJANGO_ALLOWED_HOSTS` (your API hostnames), `CORS_ALLOW_ALL=false`, `CORS_ALLOWED_ORIGINS` (your frontend origins, comma-separated). Use the **same** `DJANGO_SECRET_KEY` on web, worker, and beat.
+
+Build the frontend with `npm run build` and host `frontend/dist/` as a static site; set `VITE_API_BASE_URL` to your public API origin. After deploy, run `migrate` and `seed_playto` once (e.g. host shell).
 
 ## EXPLAINER
 
