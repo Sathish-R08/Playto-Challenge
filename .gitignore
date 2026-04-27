@@ -1,11 +1,44 @@
-backend/.venv/
-backend/__pycache__/
-backend/**/__pycache__/
-backend/db.sqlite3
+# Secrets and local env (never commit real credentials)
+.env
+.env.local
+.env.*.local
 backend/.env
-frontend/node_modules/
-frontend/dist/
-*.pyc
+frontend/.env
+frontend/.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+backend/.venv/
 .pytest_cache/
 .coverage
 htmlcov/
+*.egg-info/
+dist/
+build/
+
+# Django / local DB
+*.sqlite3
+backend/db.sqlite3
+
+# Celery Beat local scheduler (SQLite); stop beat before deleting if "file in use"
+backend/celerybeat-schedule
+backend/celerybeat-schedule-shm
+backend/celerybeat-schedule-wal
+
+# Node / frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/
+*.swp
+*~

@@ -1,8 +1,12 @@
 # EXPLAINER — Playto Payout Engine
 
+Short answers the graders asked for, then extra notes (CORS, Celery, tests).
+
+---
+
 ## 1) The Ledger
 
-**Balance calculation (DB aggregates only)** lives in [`backend/ledger/balance.py`](backend/ledger/balance.py):
+**Paste — balance calculation (database aggregates only)** from [`backend/ledger/balance.py`](backend/ledger/balance.py):
 
 ```python
 credits = Credit.objects.filter(merchant=merchant).aggregate(
@@ -30,79 +34,103 @@ held = (
 available = credits - outstanding
 ```
 
-**Why this shape:** `Credit` rows are inbound customer payments (simulated). Any payout that is **pending**, **processing**, or **completed** is money reserved or already paid out, so it belongs in one **outstanding** sum. **`available`** is therefore a single auditable expression: **credits minus all non-failed payouts**. **`held`** is only a UI slice of outstanding (pending + processing).
+**Why credits + “debits” this way:** Credits are inbound INR (simulated customer payments). There is no separate `Debit` table: **payouts are the debits**. Any payout that is not `failed` represents funds reserved or already sent (`pending` + `processing` + `completed`), so it is summed as **`outstanding`**. **`available_paise = credits − outstanding`** is the invariant the UI shows. **`failed`** payouts are excluded from `outstanding`, so when the worker moves `processing → failed` in one `UPDATE`, the amount immediately stops counting against available — that is how “funds return” without a second money row or Python-side subtraction.
 
 ---
 
 ## 2) The Lock
 
-**API concurrency (two simultaneous payout requests):** [`backend/ledger/payout_service.py`](backend/ledger/payout_service.py) opens `transaction.atomic()`, then:
+**Paste — the serialization point for concurrent POST /payouts** from [`backend/ledger/payout_service.py`](backend/ledger/payout_service.py):
 
 ```python
-m = Merchant.objects.select_for_update().get(pk=merchant.pk)
+with transaction.atomic():
+    m = Merchant.objects.select_for_update().get(pk=merchant.pk)
+    # … idempotency replay, then merchant_balance_aggregate(m), then create Payout …
 ```
 
-All balance checks and inserts for that merchant’s payout happen while this row is locked, so another request for the **same merchant** blocks on **`SELECT … FOR UPDATE`** until the first transaction commits. The primitive is **Postgres row-level locking** via Django’s `select_for_update()`.
+Two requests for the **same merchant** cannot both pass the balance check and insert: the second blocks on **`SELECT … FOR UPDATE`** on that merchant row until the first transaction commits. Balance is re-read inside that window via **`merchant_balance_aggregate`** (SQL `SUM`s), not by summing rows in Python.
 
-**Worker concurrency (two Celery workers):** [`backend/ledger/tasks.py`](backend/ledger/tasks.py) claims work with:
+**Database primitive:** **row-level exclusive lock** on the `Merchant` row (PostgreSQL `FOR UPDATE`; SQLite serializes writers in a single process).
 
-```python
-Payout.objects.filter(status=Payout.Status.PENDING)
-    .select_for_update(skip_locked=True)
-```
-
-**Why `SKIP LOCKED` matters:** without it, two workers can end up contending on the same `pending` row in ways that are easy to get wrong (duplicate processing, double side effects). `SKIP LOCKED` makes workers **skip rows already locked** and grab the next pending payout instead.
+**Worker side:** pending claims use **`select_for_update(skip_locked=True)`** in [`backend/ledger/tasks.py`](backend/ledger/tasks.py) so multiple Celery workers do not double-claim the same payout.
 
 ---
 
 ## 3) Idempotency
 
-**How we know we’ve seen a key before:** `UNIQUE(merchant_id, key)` on `PayoutIdempotency`, plus a normal lookup under the merchant lock for replays.
+**How we know we’ve seen a key before:** `PayoutIdempotency` has **`UNIQUE (merchant_id, key)`** ([`backend/ledger/models.py`](backend/ledger/models.py)). Under the merchant lock, we **`filter(merchant, key).first()`**; if a row exists and the key is younger than 24h, we return that payout (HTTP 200) without creating another.
 
-**Same key within 24 hours:** return the same serialized `Payout` (`200`) — no second payout.
-
-**Expired key (>24 hours):** `422` with `{"code":"idempotency_key_expired",...}` — **not** the original success body.
-
-**First request in-flight + second arrives:** both requests serialize on the **merchant `select_for_update()`** for that merchant. The second observes the committed idempotency + payout row and returns the same payout payload.
-
-**Poisoned keys:** the idempotency row + payout row are created in the **same** `transaction.atomic()` block as the balance check. If anything fails, **everything rolls back** — we never commit an idempotency row without its payout.
+**First request in flight, second arrives:** both hit the same merchant lock. The second waits until the first **commits** idempotency + payout rows; then it sees the existing mapping and returns the same payout body. Same key after **24h** → **422** `idempotency_key_expired`, not a duplicate payout.
 
 ---
 
 ## 4) The State Machine
 
-Illegal transitions are rejected centrally in [`backend/ledger/state_machine.py`](backend/ledger/state_machine.py):
+**Where `failed → completed` is blocked:** [`backend/ledger/state_machine.py`](backend/ledger/state_machine.py) — only these edges are legal; anything else raises **`ValidationError`** before a status `UPDATE`:
 
 ```python
-allowed = {
-    (Payout.Status.PENDING, Payout.Status.PROCESSING),
-    (Payout.Status.PROCESSING, Payout.Status.COMPLETED),
-    (Payout.Status.PROCESSING, Payout.Status.FAILED),
-}
+def assert_legal_transition(current: str, target: str) -> None:
+    allowed = {
+        (Payout.Status.PENDING, Payout.Status.PROCESSING),
+        (Payout.Status.PROCESSING, Payout.Status.COMPLETED),
+        (Payout.Status.PROCESSING, Payout.Status.FAILED),
+    }
+    if (current, target) not in allowed:
+        raise ValidationError(
+            f"Illegal payout transition {current!r} -> {target!r}",
+            code="illegal_payout_transition",
+        )
 ```
 
-So **`failed -> completed` is impossible** (not in `allowed`). The worker calls `assert_legal_transition(...)` before guarded status updates.
+So **`(FAILED, COMPLETED)` is not in `allowed`** — there is no code path that calls `assert_legal_transition(FAILED, COMPLETED)`. The worker only transitions from **`PROCESSING`** using **guarded** `filter(pk=…, status=PROCESSING).update(…)` so a stale read cannot apply a terminal transition twice.
 
-**Atomic failure / completion (no double-free):** worker transitions use guarded updates, e.g.:
-
-```python
-updated = Payout.objects.filter(pk=p.pk, status=Payout.Status.PROCESSING).update(
-    status=Payout.Status.FAILED,
-    attempt_count=next_attempt,
-    last_error="simulated_bank_failure",
-)
-if updated == 0:
-    logger.info("payout %s failed transition skipped (race)", payout_id)
-```
-
-This relies on the DB to apply **0 or 1** row updates for the terminal transition, instead of `obj.save()` after a stale read.
+**Funds + failure:** There is no separate balance row. **`failed`** is omitted from the `outstanding` aggregate, so the **same atomic `UPDATE` that sets `status=failed`** is what makes the amount available again.
 
 ---
 
-## 5) AI Audit
+## 5) The AI Audit
 
-**What the model suggested (subtly wrong):** “Check balance in Python after fetching credits/payouts into lists,” and “use `payout.status = 'failed'; payout.save()` inside the worker.”
+**What AI-ish patterns looked tempting (wrong):**
 
-**What was wrong:** Python-side sums drift under concurrency and are easy to get subtly inconsistent with what the DB sees. `save()` after a read allows **two workers** to both think they moved the same `processing` row.
+*Wrong — sum balances in Python after `values_list` / list comprehension:*
 
-**What we shipped instead:** **DB `Sum()` aggregates** inside the locked transaction for payout creation, and **guarded `QuerySet.update(...)`** for worker transitions, plus **`select_for_update(skip_locked=True)`** for claiming.
+```python
+# BAD: races with concurrent requests; not the same snapshot as the DB sees
+credits = sum(Credit.objects.filter(merchant=m).values_list("amount_paise", flat=True))
+out = sum(Payout.objects.filter(merchant=m, status__in=held_statuses).values_list(...))
+if credits - out < amount:
+    return error
+```
+
+*Wrong — load model, mutate, `save()` in the worker after two workers might both read `PROCESSING`:*
+
+```python
+# BAD: two workers can both "succeed" a transition
+p = Payout.objects.get(pk=payout_id)
+p.status = Payout.Status.FAILED
+p.save()
+```
+
+**What was wrong:** (1) Python sums are not locked with the payout insert; another transaction can commit between read and write. (2) `get()` + `save()` is compare-and-set without a database guard — two processes can stomp the same row.
+
+**What we shipped instead:** **`Coalesce(Sum(...))` inside `transaction.atomic()`** after **`select_for_update()`** on the merchant for creates; **`QuerySet.update(...)`** with **`status=PROCESSING`** in the `WHERE` clause for terminal worker transitions; **`SKIP LOCKED`** when claiming pending work.
+
+---
+
+## Additional implementation notes (not graded sections)
+
+### Retry / “stuck in processing”
+
+[`backend/ledger/tasks.py`](backend/ledger/tasks.py): simulated bank outcomes **70% complete / 20% fail / 10% hang**. On **hang**, we bump **`attempt_count`**, set **`processing_started_at`**, and rely on Celery beat re-enqueueing **`simulate_bank_for_payout`**. Before running another simulated call, we enforce **at least 30 seconds** after the last attempt via `BACKOFF_BASE_SECONDS` and `int(30 * (2 ** (attempt_count - 1)))` in `_backoff_seconds` (exponential backoff). After **3** failed “hang” cycles we force **`failed`**.
+
+### CORS
+
+Browsers preflight **`Idempotency-Key`**. [`backend/config/settings.py`](backend/config/settings.py) extends **`CORS_ALLOW_HEADERS`** with **`idempotency-key`**.
+
+### Celery
+
+**Worker + Beat** required; schedule in `CELERY_BEAT_SCHEDULE` (claim pending every 3s, retry processing every 5s).
+
+### Tests
+
+[`backend/pytest.ini`](backend/pytest.ini) uses **`config.settings_test`** (in-memory SQLite by default). **Idempotency** test runs on SQLite; **concurrency** test needs **`USE_POSTGRES_FOR_TESTS=1`** and Postgres (see README).

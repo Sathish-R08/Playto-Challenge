@@ -11,12 +11,13 @@ from .state_machine import assert_legal_transition
 
 logger = logging.getLogger(__name__)
 
+# Challenge: retry after >30s stuck in processing; then exponential backoff.
 BACKOFF_BASE_SECONDS = 30
 MAX_BANK_ATTEMPTS = 3  # after 3 hangs, force failed
 
 
 def _backoff_seconds(after_attempt: int) -> int:
-    """Wait after attempt N (1-based) before the next bank simulation is allowed."""
+    """Min seconds after last processing_started_at before retry (attempt_count is 1-based here)."""
     if after_attempt <= 0:
         return 0
     return int(BACKOFF_BASE_SECONDS * (2 ** (after_attempt - 1)))

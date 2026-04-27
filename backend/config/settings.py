@@ -3,9 +3,14 @@ Django settings for Playto payout challenge backend.
 """
 
 import os
+import sys
 from pathlib import Path
 
+from corsheaders.defaults import default_headers
+from dotenv import load_dotenv
+
 BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / ".env")
 
 SECRET_KEY = os.environ.get(
     "DJANGO_SECRET_KEY",
@@ -112,6 +117,8 @@ if _cors:
     CORS_ALLOWED_ORIGINS = [x.strip() for x in _cors.split(",") if x.strip()]
     CORS_ALLOW_ALL_ORIGINS = False
 
+# Browsers send custom headers on POST; preflight must allow them (spec: Idempotency-Key).
+CORS_ALLOW_HEADERS = (*default_headers, "idempotency-key")
 
 CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://127.0.0.1:6379/0")
 CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", CELERY_BROKER_URL)
@@ -119,6 +126,12 @@ CELERY_TASK_ALWAYS_EAGER = os.environ.get("CELERY_TASK_ALWAYS_EAGER", "false").l
     "1",
     "true",
     "yes",
+)
+# Prefork (billiard) on Windows often raises PermissionError WinError 5 on semaphores.
+# "solo" still consumes Redis; tasks run in one process (fine for local dev). Linux/prod: prefork.
+CELERY_WORKER_POOL = os.environ.get(
+    "CELERY_WORKER_POOL",
+    "solo" if sys.platform == "win32" else "prefork",
 )
 CELERY_BEAT_SCHEDULE = {
     "claim-pending-payouts": {

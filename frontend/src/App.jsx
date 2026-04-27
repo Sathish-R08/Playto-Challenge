@@ -164,7 +164,7 @@ export default function App() {
         </section>
 
         <section className="rounded-lg border border-slate-800 bg-slate-900/30 p-5">
-          <h2 className="text-lg font-medium">Recent credits</h2>
+          <h2 className="text-lg font-medium">Recent credits (money in)</h2>
           <div className="mt-3 overflow-x-auto">
             <table className="w-full text-left text-sm">
               <thead className="text-xs uppercase text-slate-400">
@@ -190,7 +190,7 @@ export default function App() {
 
       <section className="mt-8 rounded-lg border border-slate-800 bg-slate-900/30 p-5">
         <div className="flex items-center justify-between gap-3">
-          <h2 className="text-lg font-medium">Payout history</h2>
+          <h2 className="text-lg font-medium">Payout history (debits / withdrawals)</h2>
           <button
             type="button"
             className="rounded-md border border-slate-700 px-3 py-1 text-xs text-slate-200 hover:bg-slate-900"
